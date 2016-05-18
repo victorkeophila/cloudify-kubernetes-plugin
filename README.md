@@ -1,6 +1,6 @@
 ## Cloudify Kubernetes Plugin
 
-This project contains a plugin that enables Cloudify to install, configure, and run services on a Kubernetes cluster.
+This project contains a plugin that enables Cloudify to install, configure, and run services on a Kubernetes cluster.  Note: currently installs Kubernetes version 1.2.4.
 
 Limitations (as of 5/2/2016):
 + Only tested on Ubuntu 14
