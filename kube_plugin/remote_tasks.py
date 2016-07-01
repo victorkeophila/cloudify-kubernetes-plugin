@@ -17,6 +17,7 @@
 # Kubernetes plugin implementation
 #
 from cloudify.decorators import operation
+from cloudify.exceptions import NonRecoverableError, RecoverableError
 from cloudify import ctx,manager,utils
 from fabric.api import env, put, run, sudo
 import os
@@ -151,13 +152,14 @@ def kube_delete(**kwargs):
   env['user']=ctx.node.properties['ssh_username']
   env['key_filename']=ctx.node.properties['ssh_keyfilename']
 
-  if "kinds" in ctx.instance.runtime_properties:
-    for kind in ctx.instance.runtime_properties['kinds'].split(","):
-      kind=kind.split(':')
-      cmd="./kubectl delete {} {}".format(kind[0],kind[1])
-      output=run(cmd)
-      if(output.return_code):
-        raise(NonRecoverableError('kubectl delete failed:{}'.format(output.stderr)))
+  if "kubernetes_resources" in ctx.instance.runtime_properties:
+    for resource_name, kind_types in ctx.instance.runtime_properties['kinds'].iteritems():
+      ctx.logger.info("deleting resource={} types={}".format(resource_name, kind_types))
+      for kind_type in kind_types:
+        cmd="./kubectl delete {} {}".format(kind_type, resource_name)
+        output=run(cmd)
+        if(output.return_code):
+          raise(NonRecoverableError('kubectl delete failed:{}'.format(output.stderr)))
   
       
   #cmd="./kubectl delete {}s {}".format(ctx.instance.runtime_properties['kind'],ctx.node.properties['name'])
@@ -198,6 +200,9 @@ def kube_run_expose(**kwargs):
 
   #file config
   elif(len(config_files)):
+
+    # /!\ Using dict won't work if using multiple Service or ReplicationController ...
+    resources={}
     for file in config_files:
       if (not ctx._local):
         local_path=ctx.download_resource(file['file'])
@@ -207,12 +212,10 @@ def kube_run_expose(**kwargs):
         base=yaml.load(f)
 
         #store kinds for uninstall
-        kinds=""
-        if 'kinds' in ctx.instance.runtime_properties:
-          kinds=ctx.instance.runtime_properties['kinds']+","+base['kind']+":"+base['metadata']['name']
-        else:
-          kinds=base['kind']+":"+base['metadata']['name']
-        ctx.instance.runtime_properties['kinds']=kinds
+        metadata_name=base['metadata']['name']
+        if metadata_name not in resources:
+          resources[metadata_name]=[]
+          resources[metadata_name].append(base['kind'])
 
       if('overrides' in file):
         for o in file['overrides']:
@@ -221,6 +224,17 @@ def kube_run_expose(**kwargs):
           o=process_subs(o)
           exec "base"+o in globals(),locals()
       write_and_run(base)
+
+    # Add service runtime properties
+    for resource in resources:
+       ctx.logger.info("resource={}".format(resource))
+       for kind_type in resources[resource]:
+         ctx.logger.info("kind_type={}".format(kind_type))
+         if "Service" == kind_type:
+           add_service_in_runtime_properties(resource, ctx)
+
+    ctx.instance.runtime_properties['kubernetes_resources']=resources
+
 
   #built-in config
   else:
@@ -241,3 +255,18 @@ def kube_run_expose(**kwargs):
     output=call(cmd)
     if(output.return_code):
       raise(NonRecoverableError('kubectl expose failed:{}'.format(output.stderr)))
+
+    # Add service runtime properties
+    add_service_in_runtime_properties(ctx.node.properties['name'], ctx)
+
+def add_service_in_runtime_properties(service_name, ctx):
+  cmd='./kubectl -s http://localhost:8080 get service {} -o yaml'.format(service_name)
+  ctx.logger.info("Running command to retrieve services: {}".format(cmd))
+  output=run(cmd)
+  service_k8s=yaml.load(output)
+  ctx.logger.info("service_k8s={}".format(service_k8s))
+  service={}
+  service['name']=service_name
+  service['clusterIP']=service_k8s['spec']['clusterIP']
+  service['ports']=service_k8s['spec']['ports']
+  ctx.instance.runtime_properties['service']=service
