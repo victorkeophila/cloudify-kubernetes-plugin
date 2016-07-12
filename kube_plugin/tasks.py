@@ -142,7 +142,7 @@ def kube_run_expose(**kwargs):
     fname="/tmp/kub_{}.yaml".format(ctx.instance.id)
     with open(fname,'w') as f:
       yaml.safe_dump(d,f)
-    cmd="./kubectl -s http://localhost:8080 create -f "+fname + " >> /tmp/kubectl.out 2>&1"
+    cmd="sudo /usr/local/bin/kubectl -s http://localhost:8080 create -f "+fname + " >> /tmp/kubectl.out 2>&1"
     ctx.logger.info("running create: {}".format(cmd))
 
     #retry a few times
@@ -173,14 +173,14 @@ def kube_run_expose(**kwargs):
       write_and_run(base)
   else:
     # do kubectl run
-    cmd='./kubectl -s http://localhost:8080 run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
+    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
     if(ctx.node.properties['run_overrides']):
       cmd=cmd+" --overrides={}".format(ctx.node.properties['run_overrides'])
 
     subprocess.call(cmd,True)
 
     # do kubectl expose
-    cmd='./kubectl -s http://localhost:8080 expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
+    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
     if(ctx.node.properties['expose_overrides']):
       cmd=cmd+" --overrides={}".format(ctx.node.properties['expose_overrides'])
 

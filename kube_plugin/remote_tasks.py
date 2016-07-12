@@ -26,6 +26,10 @@ import re
 import time
 import subprocess
 import yaml
+import traceback
+
+K8S_GET_SERVICE_CLUSTERIP = "get_service_clusterIP"
+K8S_GET_SERVICE_PORT = "get_service_port"
 
 # Called when connecting to master.  Gets ip and port
 @operation
@@ -103,6 +107,11 @@ def process_subs(s):
     #no patterns found
     ctx.logger.info('no pattern found:{}'.format(s))
     return s;
+
+  ctx.logger.info("matching the configs")
+
+  k8s_custom_func = [K8S_GET_SERVICE_CLUSTERIP, K8S_GET_SERVICE_PORT]
+
   while(m):
 
     # Match @ syntax.  Gets runtime properties
@@ -114,33 +123,73 @@ def process_subs(s):
         # do substitution
         if(not client):
           client=manager.get_rest_client()
-        instances=client.node_instances.list(deployment_id=ctx.deployment.id,node_name=fields[0])
-        if(instances and len(instances)):
-          #just use first instance if more than one
-          val=instances[0].runtime_properties
-          for field in fields[1:]:
-            field=field.strip()
-            val=val[field]    #handle nested maps
-  
-          s=s[:m.start()]+str(val)+s[m.end(1)+1:]
-          m=re.search(pat,s)
+
+        if( fields[0] in k8s_custom_func ):
+          node_id = fields[1].strip()
+          if(fields[0] == K8S_GET_SERVICE_CLUSTERIP):
+            relationship_instance = get_one_relationship_instance(ctx, node_id)
+            if relationship_instance is not None:
+              if('service' in relationship_instance.runtime_properties):
+                val = relationship_instance.runtime_properties['service']['clusterIP']
+                s = s[:m.start()] + str(val) + s[m.end(1) + 1:]
+                ctx.logger.info("Service clusterIP property found ({}) on node {}".format(val, node_id))
+              else:
+                ctx.logger.info("No service found on the node '{}'".format(node_id))
+            else:
+              ctx.logger.info("No relationship found with node '{}'".format(node_id))
+          elif(fields[0] == K8S_GET_SERVICE_PORT):
+            relationship_instance = get_one_relationship_instance(ctx, node_id)
+            if relationship_instance is not None:
+              if('service' in relationship_instance.runtime_properties):
+                val = relationship_instance.runtime_properties['service']['ports'][0]['port']
+                s = s[:m.start()] + str(val) + s[m.end(1) + 1:]
+                ctx.logger.info("Service port property found ({}) on node {}".format(val, node_id))
+              else:
+                ctx.logger.info("No service found on the node '{}'".format(node_id))
+            else:
+                ctx.logger.info("No relationship found with node '{}'".format(node_id))
+          m = re.search(pat, s)
         else:
-          raise Exception("no instances found for node: {}".format(fields[0]))
+          instances=client.node_instances.list(deployment_id=ctx.deployment.id,node_name=fields[0])
+          if(instances and len(instances)):
+            #just use first instance if more than one
+            val=instances[0].runtime_properties
+            for field in fields[1:]:
+              field=field.strip()
+              val=val[field]    #handle nested maps
+
+            s=s[:m.start()]+str(val)+s[m.end(1)+1:]
+            m=re.search(pat,s)
+          else:
+            raise Exception("no instances found for node: {}".format(fields[0]))
       else:
         raise Exception("invalid pattern: "+s)
 
     # Match % syntax.  Gets context property.
     # also handles special token "management_ip"
     elif(m.group(2)):
-      with open("/tmp/subs","a+") as f:
-        f.write("m.group(2)="+str(m.group(2))+"\n")
-      if(m.group(2)=="management_ip"):
-        s=s[:m.start()]+str(utils.get_manager_ip())+s[m.end(2)+1:]
-      else:
-        s=s[:m.start()]+str(eval("ctx."+m.group(2)))+s[m.end(2)+1:]
-      m=re.search(pat,s)
+      fields=m.group(2).split(',')
+      if len(fields)>0:
+        with open("/tmp/subs","a+") as f:
+          f.write("m.group(2)="+str(m.group(2))+"\n")
+        if(m.group(2)=="management_ip"):
+          s=s[:m.start()]+str(utils.get_manager_ip())+s[m.end(2)+1:]
+        else:
+          s=s[:m.start()]+str(eval("ctx."+m.group(2)))+s[m.end(2)+1:]
+        m=re.search(pat,s)
       
   return s
+
+
+#
+# Retrieve the target relationship of the current instance based on the target node_id.
+# It returns the first found instance.
+#
+def get_one_relationship_instance(ctx, node_id):
+  for relationship in ctx.instance.relationships:
+    if relationship.target is not None and relationship.target.node.id == node_id:
+      return relationship.target.instance
+  return None
 
 #
 # delete existing item
@@ -153,16 +202,16 @@ def kube_delete(**kwargs):
   env['key_filename']=ctx.node.properties['ssh_keyfilename']
 
   if "kubernetes_resources" in ctx.instance.runtime_properties:
-    for resource_name, kind_types in ctx.instance.runtime_properties['kinds'].iteritems():
+    for resource_name, kind_types in ctx.instance.runtime_properties['kubernetes_resources'].iteritems():
       ctx.logger.info("deleting resource={} types={}".format(resource_name, kind_types))
       for kind_type in kind_types:
-        cmd="./kubectl delete {} {}".format(kind_type, resource_name)
+        cmd="sudo /usr/local/bin/kubectl delete {} {}".format(kind_type, resource_name)
         output=run(cmd)
         if(output.return_code):
           raise(NonRecoverableError('kubectl delete failed:{}'.format(output.stderr)))
   
       
-  #cmd="./kubectl delete {}s {}".format(ctx.instance.runtime_properties['kind'],ctx.node.properties['name'])
+  #cmd="sudo /usr/local/bin/kubectl delete {}s {}".format(ctx.instance.runtime_properties['kind'],ctx.node.properties['name'])
   
   #output=run(cmd)
   #if(output.return_code):
@@ -173,7 +222,6 @@ def kube_delete(**kwargs):
 #
 @operation
 def kube_run_expose(**kwargs):
-  ctx.logger.info("in kube_run_expose")
   config=ctx.node.properties['config']
   config_files=ctx.node.properties['config_files']
   env['host_string']=ctx.instance.runtime_properties['master_ip']
@@ -187,7 +235,7 @@ def kube_run_expose(**kwargs):
     with open(fname,'w') as f:
       yaml.safe_dump(d,f)
     put(fname,fname)
-    cmd="./kubectl -s http://localhost:8080 create -f "+fname + " >> /tmp/kubectl.out 2>&1"
+    cmd="sudo /usr/local/bin/kubectl -s http://localhost:8080 create -f "+fname + " >> /tmp/kubectl.out 2>&1"
     ctx.logger.info("running create: {}".format(cmd))
 
     output=run(cmd)
@@ -211,25 +259,26 @@ def kube_run_expose(**kwargs):
       with open(local_path) as f:
         base=yaml.load(f)
 
-        #store kinds for uninstall
+        #store kubernetes resources for uninstall
         metadata_name=base['metadata']['name']
         if metadata_name not in resources:
           resources[metadata_name]=[]
           resources[metadata_name].append(base['kind'])
 
       if('overrides' in file):
-        for o in file['overrides']:
-          ctx.logger.info("exeing o={}".format(o))
-          #check for substitutions
-          o=process_subs(o)
-          exec "base"+o in globals(),locals()
+        try: 
+          for o in file['overrides']:
+            ctx.logger.info("exeing o={}".format(o))
+            #check for substitutions
+            o=process_subs(o)
+            exec "base"+o in globals(),locals()
+        except:
+          raise(RecoverableError("Erreur in process_subs: {}".format(traceback.format_exc())))
       write_and_run(base)
 
     # Add service runtime properties
     for resource in resources:
-       ctx.logger.info("resource={}".format(resource))
        for kind_type in resources[resource]:
-         ctx.logger.info("kind_type={}".format(kind_type))
          if "Service" == kind_type:
            add_service_in_runtime_properties(resource, ctx)
 
@@ -239,7 +288,7 @@ def kube_run_expose(**kwargs):
   #built-in config
   else:
     # do kubectl run
-    cmd='./kubectl -s http://localhost:8080 run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
+    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
     if(ctx.node.properties['run_overrides']):
       cmd=cmd+" --overrides={}".format(ctx.node.properties['run_overrides'])
 
@@ -248,7 +297,7 @@ def kube_run_expose(**kwargs):
       raise(NonRecoverableError('kubectl run failed:{}'.format(output.stderr)))
 
     # do kubectl expose
-    cmd='./kubectl -s http://localhost:8080 expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
+    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
     if(ctx.node.properties['expose_overrides']):
       cmd=cmd+" --overrides={}".format(ctx.node.properties['expose_overrides'])
 
@@ -260,11 +309,11 @@ def kube_run_expose(**kwargs):
     add_service_in_runtime_properties(ctx.node.properties['name'], ctx)
 
 def add_service_in_runtime_properties(service_name, ctx):
-  cmd='./kubectl -s http://localhost:8080 get service {} -o yaml'.format(service_name)
+  cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 get service {} -o yaml'.format(service_name)
   ctx.logger.info("Running command to retrieve services: {}".format(cmd))
   output=run(cmd)
   service_k8s=yaml.load(output)
-  ctx.logger.info("service_k8s={}".format(service_k8s))
+  ctx.logger.info("Service {}={}".format(service_name, service_k8s))
   service={}
   service['name']=service_name
   service['clusterIP']=service_k8s['spec']['clusterIP']

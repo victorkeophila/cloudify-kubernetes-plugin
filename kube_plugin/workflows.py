@@ -21,7 +21,7 @@ def kube_scale(**kwargs):
 
   #if the request is an increment, get current value
   if(kwargs['amount'][0]=='+' or kwargs['amount'][0]=='-'):
-    output=run("./kubectl -s http://localhost:8080 get rc --no-headers {}".format(name))
+    output=run("sudo /usr/local/bin/kubectl -s http://localhost:8080 get rc --no-headers {}".format(name))
     curinstances=int(output.stdout.split()[4])
     inc=int(kwargs['amount'])
     amount=curinstances+inc
@@ -29,8 +29,8 @@ def kube_scale(**kwargs):
     amount=int(kwargs['amount'])
 
   with open("/tmp/log","a") as f:
-    f.write("running: ./kubectl -s http://localhost:8080 scale --replicas={} rc {}".format(amount,name))
-  run("./kubectl -s http://localhost:8080 scale --replicas={} rc {}".format(amount,name))
+    f.write("running: sudo /usr/local/bin/kubectl -s http://localhost:8080 scale --replicas={} rc {}".format(amount,name))
+  run("sudo /usr/local/bin/kubectl -s http://localhost:8080 scale --replicas={} rc {}".format(amount,name))
 
 #
 # Run an image on the cluster pointed to by the master arg
@@ -52,7 +52,7 @@ def kube_create(**kwargs):
     
     put(res,"/tmp/manifest.yaml")
 
-  run("./kubectl -s http://localhost:8080 create -f /tmp/manifest.yaml")
+  run("sudo /usr/local/bin/kubectl -s http://localhost:8080 create -f /tmp/manifest.yaml")
 
 #
 # Run an image on the cluster pointed to by the master arg
@@ -62,7 +62,7 @@ def kube_run(**kwargs):
   setfabenv(kwargs)
   optstr=buildopts(kwargs,{"dry_run":"dry-run"},{"port":"not _val_ == -1"},["dry_run"],['name','master'])
   ctx.logger.info("Running: {}".format(optstr))
-  run("./kubectl -s http://localhost:8080 run "+" "+kwargs['name']+optstr)
+  run("sudo /usr/local/bin/kubectl -s http://localhost:8080 run "+" "+kwargs['name']+optstr)
 
 #
 # Expose an app
@@ -71,7 +71,7 @@ def kube_run(**kwargs):
 def kube_expose(**kwargs):
   setfabenv(kwargs)
   optstr=buildopts(kwargs,{"target_port":"target-port","service_name":"service-name"},{"target_port":"not _val_ == -1"},[],['name','master','resource'])
-  runstr="./kubectl -s http://localhost:8080 expose {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
+  runstr="sudo /usr/local/bin/kubectl -s http://localhost:8080 expose {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
   ctx.logger.info("Running: {}".format(runstr))
   run(runstr)
   
@@ -82,7 +82,7 @@ def kube_expose(**kwargs):
 def kube_stop(**kwargs):
   setfabenv(kwargs)
   optstr=buildopts(kwargs,{},{},["all"],['name','master','resource'])
-  runstr="./kubectl -s http://localhost:8080 stop {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
+  runstr="sudo /usr/local/bin/kubectl -s http://localhost:8080 stop {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
   ctx.logger.info("Running: {}".format(runstr))
   run(runstr)
   
@@ -93,7 +93,7 @@ def kube_stop(**kwargs):
 def kube_delete(**kwargs):
   setfabenv(kwargs)
   optstr=buildopts(kwargs,{},{},["all"],['name','master','resource'])
-  runstr="./kubectl -s http://localhost:8080 delete {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
+  runstr="sudo /usr/local/bin/kubectl -s http://localhost:8080 delete {} {} {}".format(kwargs['resource'],kwargs['name'],optstr)
   ctx.logger.info("Running: {}".format(runstr))
   with open("/tmp/log","a") as f:
     f.write("executing {}\n".format(runstr))
