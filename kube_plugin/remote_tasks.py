@@ -28,8 +28,9 @@ import subprocess
 import yaml
 import traceback
 
-K8S_GET_SERVICE_CLUSTERIP = "get_service_clusterIP"
-K8S_GET_SERVICE_PORT = "get_service_port"
+K8S_GET_SERVICE = "get_service"
+K8S_PROPS_CLUSTERIP = "clusterIP"
+K8S_PROPS_PORT = "port"
 
 # Called when connecting to master.  Gets ip and port
 @operation
@@ -110,8 +111,6 @@ def process_subs(s):
 
   ctx.logger.info("matching the configs")
 
-  k8s_custom_func = [K8S_GET_SERVICE_CLUSTERIP, K8S_GET_SERVICE_PORT]
-
   while(m):
 
     # Match @ syntax.  Gets runtime properties
@@ -124,40 +123,49 @@ def process_subs(s):
         if(not client):
           client=manager.get_rest_client()
 
-        if( fields[0] in k8s_custom_func ):
+        if( fields[0] == K8S_GET_SERVICE ):
           node_id = fields[1].strip()
-          if(fields[0] == K8S_GET_SERVICE_CLUSTERIP):
-            relationship_instance = get_one_relationship_instance(ctx, node_id)
-            if relationship_instance is not None:
-              if('service' in relationship_instance.runtime_properties):
-                val = relationship_instance.runtime_properties['service']['clusterIP']
-                s = s[:m.start()] + str(val) + s[m.end(1) + 1:]
-                ctx.logger.info("Service clusterIP property found ({}) on node {}".format(val, node_id))
-              else:
-                ctx.logger.info("No service found on the node '{}'".format(node_id))
+          property_key = fields[2].strip()
+          relationship_instance = get_one_relationship_instance(ctx, node_id)
+          if relationship_instance is not None:
+            if('service' in relationship_instance.runtime_properties):
+              service_properties = relationship_instance.runtime_properties['service']
+              if(property_key == K8S_PROPS_CLUSTERIP):
+                val = service_properties['clusterIP']
+              elif(property_key == K8S_PROPS_PORT):
+                val = service_properties['ports'][0]['port']
+              s = s[:m.start()] + str(val) + s[m.end(1) + 1:]
+              ctx.logger.info("Service port property found ({}) on node {}".format(val, node_id))
             else:
-              ctx.logger.info("No relationship found with node '{}'".format(node_id))
-          elif(fields[0] == K8S_GET_SERVICE_PORT):
-            relationship_instance = get_one_relationship_instance(ctx, node_id)
-            if relationship_instance is not None:
-              if('service' in relationship_instance.runtime_properties):
-                val = relationship_instance.runtime_properties['service']['ports'][0]['port']
-                s = s[:m.start()] + str(val) + s[m.end(1) + 1:]
-                ctx.logger.info("Service port property found ({}) on node {}".format(val, node_id))
-              else:
-                ctx.logger.info("No service found on the node '{}'".format(node_id))
-            else:
-                ctx.logger.info("No relationship found with node '{}'".format(node_id))
+              raise Exception("No service found on the node '{}'".format(node_id))
+          else:
+              raise Exception("No relationship found with node '{}'".format(node_id))
           m = re.search(pat, s)
         else:
           instances=client.node_instances.list(deployment_id=ctx.deployment.id,node_name=fields[0])
           if(instances and len(instances)):
-            #just use first instance if more than one
-            val=instances[0].runtime_properties
+            # Just use first instance if more than one
+            node_instance=instances[0]
+            # If variable not found in runtime properties, search in the node properties
+            if( fields[1] not in node_instance.runtime_properties):
+              node=client.nodes.get(deployment_id=ctx.deployment.id,node_id=node_instance.node_id)
+              val=node.properties
+            else:
+              val=node_instance.runtime_properties
+            # Get the value
             for field in fields[1:]:
               field=field.strip()
-              val=val[field]    #handle nested maps
-
+              if( field == "ip" ):
+                # Special treatment for ip value
+                host_instance_id=node_instance.host_id
+                host_instance=client.node_instances.get(host_instance_id)
+                if(host_instance):
+                  val=host_instance.runtime_properties['ip']
+                else:
+                  raise Exception("ip not found for node: {}".format(fields[0]))
+              else:
+                val=val[field] #handle nested maps
+            # Override the expression in the node
             s=s[:m.start()]+str(val)+s[m.end(1)+1:]
             m=re.search(pat,s)
           else:
