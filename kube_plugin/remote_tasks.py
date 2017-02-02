@@ -203,6 +203,15 @@ def get_one_relationship_instance(ctx, node_id):
   return None
 
 
+def wait_until_pods_deleted(k8s_master_url, resource_name):
+    cmd = "get po -l app={} --no-headers 2>/dev/null | grep {} | wc -l".format(resource_name, resource_name)
+    current_pod_numbers = int(execute_kubectl_command(k8s_master_url, cmd))
+    while current_pod_numbers != 0:
+      ctx.logger.info("Waiting pods to ReplicationContoller {} to be deleted (remaining={})".format(resource_name, current_pod_numbers))
+      time.sleep(1)
+      current_pod_numbers = int(execute_kubectl_command(k8s_master_url, cmd))
+
+
 #
 # delete existing item
 # Note ONLY FUNCTIONS FOR FILE BASED CONFIG
@@ -220,6 +229,8 @@ def kube_delete(**kwargs):
         cmd = "delete {} {}".format(kind_type, resource_name)
         ctx.logger.info("Running command '{}'".format(cmd))
         execute_kubectl_command(k8s_master_url, cmd)
+        if kind_type == 'ReplicationController':
+          wait_until_pods_deleted(k8s_master_url, resource_name)
 
 
 #
@@ -297,6 +308,18 @@ def execute_kubectl_command(master_url, args):
     return stdout_consumer.buffer.getvalue()
 
 
+def wait_until_pods_running(k8s_master_url, yaml_content):
+    if yaml_content['kind'] == 'ReplicationController':
+        expected_replicas = int(yaml_content['spec']['replicas'])
+        selector_app_value = yaml_content['spec']['selector']['app']
+        cmd = "get po -l app={} --no-headers 2>/dev/null | grep Running | wc -l".format(selector_app_value)
+        current_replicas = int(execute_kubectl_command(k8s_master_url, cmd))
+        while current_replicas < expected_replicas:
+            ctx.logger.info("Waiting for pod {} ({}/{})".format(selector_app_value, current_replicas, expected_replicas))
+            time.sleep(1)
+            current_replicas = int(execute_kubectl_command(k8s_master_url, cmd))
+
+
 #
 # Use kubectl to run and expose a service
 #
@@ -311,12 +334,13 @@ def kube_run_expose(**kwargs):
 
   ctx.logger.info("Kubernetes master url={}".format(k8s_master_url))
 
-  def write_and_run(d):
+  def write_and_run(yaml_content):
     fname="/tmp/kub_{}_{}.yaml".format(ctx.instance.id,time.time())
     with open(fname,'w') as f:
-      yaml.safe_dump(d,f)
+      yaml.safe_dump(yaml_content,f)
     cmd="create -f {}".format(fname)
     execute_kubectl_command(k8s_master_url, cmd)
+    wait_until_pods_running(k8s_master_url, yaml_content)
 
   #embedded config
   if(config):
@@ -362,6 +386,7 @@ def kube_run_expose(**kwargs):
 
   #built-in config
   else:
+    # !! Not used in Alien4Cloud plugin !!
     # do kubectl run
     cmd = 'run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
     if(ctx.node.properties['run_overrides']):
