@@ -16,21 +16,26 @@
 #
 # Kubernetes plugin implementation
 #
+from cloudify import ctx, manager, utils
 from cloudify.decorators import operation
 from cloudify.exceptions import NonRecoverableError, RecoverableError
-from cloudify import ctx,manager,utils
-from fabric.api import env, put, run, sudo
+from StringIO import StringIO
 import os
-import sys
 import re
-import time
 import subprocess
-import yaml
+import sys
+import threading
+import time
 import traceback
+import yaml
+
+
+KUBECTL_PATH = "/usr/local/bin/kubectl"
 
 K8S_GET_SERVICE = "get_service"
 K8S_PROPS_CLUSTERIP = "clusterIP"
 K8S_PROPS_PORT = "port"
+
 
 # Called when connecting to master.  Gets ip and port
 @operation
@@ -39,47 +44,44 @@ def connect_master(**kwargs):
   ctx.target.node._get_node_if_needed()
   if(ctx._local):
     ctx.logger.info("running local mode")
-    ctx.source.instance.runtime_properties['master_ip']=ctx.target.node.properties['ip']
+    ctx.source.instance.runtime_properties['master_ip'] = ctx.target.node.properties['ip']
   elif(ctx.target.node._node.type=='cloudify.kubernetes.Master'):
     ctx.logger.info("connecting to master node")
-    ctx.source.instance.runtime_properties['master_ip']=ctx.target.instance.runtime_properties['ip']
+    ctx.source.instance.runtime_properties['master_ip'] = ctx.target.instance.runtime_properties['ip']
     #following properties ignored for non-fabric operation
-    ctx.source.instance.runtime_properties['master_port']=ctx.target.node.properties['master_port']
-    ctx.source.instance.runtime_properties['ssh_username']=ctx.target.node.properties['ssh_username']
-    ctx.source.instance.runtime_properties['ssh_password']=ctx.target.node.properties['ssh_password']
-    ctx.source.instance.runtime_properties['ssh_port']=ctx.target.node.properties['ssh_port']
-    ctx.source.instance.runtime_properties['ssh_keyfilename']=ctx.target.node.properties['ssh_keyfilename']
-  elif(ctx.target.node._node.type=='cloudify.nodes.DeploymentProxy'):
+    ctx.source.instance.runtime_properties['master_port'] = ctx.target.node.properties['master_port']
+    ctx.source.instance.runtime_properties['ssh_username'] = ctx.target.node.properties['ssh_username']
+    ctx.source.instance.runtime_properties['ssh_password'] = ctx.target.node.properties['ssh_password']
+    ctx.source.instance.runtime_properties['ssh_port'] = ctx.target.node.properties['ssh_port']
+    ctx.source.instance.runtime_properties['ssh_keyfilename'] = ctx.target.node.properties['ssh_keyfilename']
+  elif(ctx.target.node._node.type == 'cloudify.nodes.DeploymentProxy'):
     ctx.logger.info("connecting to dproxy")
-    ctx.logger.info("got *dproxy url:"+ctx.target.instance.runtime_properties['kubernetes_info']['url'])
-
+    ctx.logger.info("got *dproxy url:" + ctx.target.instance.runtime_properties['kubernetes_info']['url'])
     try:
-
-      r=re.match('http://(.*):(.*)',ctx.target.instance.runtime_properties['kubernetes_info']['url'])
-
+      r = re.match('http://(.*):(.*)',ctx.target.instance.runtime_properties['kubernetes_info']['url'])
       ctx.logger.info("GROUPS:{}".format(r.groups()))
-
       ctx.source.instance.runtime_properties['master_ip']=r.group(1)
       ctx.source.instance.runtime_properties['master_port']=r.group(2)
     except:
       print "Unexpected error:", sys.exc_info()[0]
       raise
-
   else:
     raise(NonRecoverableError('unsupported relationship'))
     
+
 # called to connect to a deployment proxy.  generalization of connect_master
 @operation
 def connect_proxy(**kwargs):
   if (ctx.target.node._node.type!='cloudify.nodes.DeploymentProxy'):
     raise (NonRecoverableError('must connect to DeploymentProxy type'))
-
   for output in ctx.target.node.properties['inherit_outputs']:
     ctx.source.instance.runtime_properties[output]=ctx.target.instance.runtime_properties[output]
+
     
 @operation
 def contained_in(**kwargs):
   ctx.source.instance.runtime_properties['ip']=ctx.target.instance.runtime_properties['ip']
+
 
 @operation
 def copy_rtprops(**kwargs):
@@ -88,7 +90,8 @@ def copy_rtprops(**kwargs):
   for prop in kwargs['prop_list'].split(','):
     if(prop in ctx.target.instance.runtime_properties):
       ctx.source.instance.runtime_properties[prop]=ctx.target.instance.runtime_properties[prop]
-    
+
+
 #
 # Perform substitutions in overrides
 #
@@ -97,9 +100,9 @@ def process_subs(s):
   with open("/tmp/subs","a+") as f:
     f.write("processing "+s)
 
-  pat='@{([^}]+)}|%{([^}]+)}'
-  client=None
-  m=re.search(pat,s)
+  pat = '@{([^}]+)}|%{([^}]+)}'
+  client = None
+  m = re.search(pat,s)
 
   with open("/tmp/subs","a+") as f:
     f.write(" m "+str(m)+"\n")
@@ -117,11 +120,11 @@ def process_subs(s):
     if(m.group(1)):
       with open("/tmp/subs","a+") as f:
         f.write(" m.group(1)="+str(m.group(1))+"\n")
-      fields=m.group(1).split(',')
+      fields = m.group(1).split(',')
       if m and len(fields)>1:
         # do substitution
         if(not client):
-          client=manager.get_rest_client()
+          client = manager.get_rest_client()
 
         if( fields[0] == K8S_GET_SERVICE ):
           node_id = fields[1].strip()
@@ -142,36 +145,36 @@ def process_subs(s):
               raise Exception("No relationship found with node '{}'".format(node_id))
           m = re.search(pat, s)
         else:
-          instances=client.node_instances.list(deployment_id=ctx.deployment.id,node_name=fields[0])
+          instances = client.node_instances.list(deployment_id=ctx.deployment.id,node_name=fields[0])
           if(instances and len(instances)):
             # Just use first instance if more than one
-            node_instance=instances[0]
+            node_instance = instances[0]
             # If variable not found in runtime properties, search in the node properties
             if( fields[1] not in node_instance.runtime_properties):
-              node=client.nodes.get(deployment_id=ctx.deployment.id,node_id=node_instance.node_id)
-              val=node.properties
+              node = client.nodes.get(deployment_id=ctx.deployment.id,node_id=node_instance.node_id)
+              val = node.properties
             else:
-              val=node_instance.runtime_properties
+              val = node_instance.runtime_properties
             # Get the value
             for field in fields[1:]:
-              field=field.strip()
+              field = field.strip()
               if( field == "ip" ):
                 # Special treatment for ip value
-                host_instance_id=node_instance.host_id
-                host_instance=client.node_instances.get(host_instance_id)
+                host_instance_id = node_instance.host_id
+                host_instance = client.node_instances.get(host_instance_id)
                 if(host_instance):
-                  val=host_instance.runtime_properties['ip']
+                  val = host_instance.runtime_properties['ip']
                 else:
                   raise Exception("ip not found for node: {}".format(fields[0]))
               else:
-                val=val[field] #handle nested maps
+                val = val[field] #handle nested maps
             # Override the expression in the node
-            s=s[:m.start()]+str(val)+s[m.end(1)+1:]
-            m=re.search(pat,s)
+            s = s[:m.start()] + str(val) + s[m.end(1)+1:]
+            m = re.search(pat,s)
           else:
             raise Exception("no instances found for node: {}".format(fields[0]))
       else:
-        raise Exception("invalid pattern: "+s)
+        raise Exception("invalid pattern: " + s)
 
     # Match % syntax.  Gets context property.
     # also handles special token "management_ip"
@@ -179,12 +182,12 @@ def process_subs(s):
       fields=m.group(2).split(',')
       if len(fields)>0:
         with open("/tmp/subs","a+") as f:
-          f.write("m.group(2)="+str(m.group(2))+"\n")
+          f.write("m.group(2)=" + str(m.group(2)) + "\n")
         if(m.group(2)=="management_ip"):
-          s=s[:m.start()]+str(utils.get_manager_ip())+s[m.end(2)+1:]
+          s = s[:m.start()] + str(utils.get_manager_ip()) + s[m.end(2) + 1:]
         else:
-          s=s[:m.start()]+str(eval("ctx."+m.group(2)))+s[m.end(2)+1:]
-        m=re.search(pat,s)
+          s = s[:m.start()] + str(eval("ctx." + m.group(2))) + s[m.end(2) + 1:]
+        m = re.search(pat,s)
       
   return s
 
@@ -199,56 +202,121 @@ def get_one_relationship_instance(ctx, node_id):
       return relationship.target.instance
   return None
 
+
 #
 # delete existing item
 # Note ONLY FUNCTIONS FOR FILE BASED CONFIG
 #
 @operation
 def kube_delete(**kwargs):
-  env['host_string']=ctx.instance.runtime_properties['master_ip']
-  env['user']=ctx.node.properties['ssh_username']
-  env['key_filename']=ctx.node.properties['ssh_keyfilename']
+  k8s_master_ip = ctx.instance.runtime_properties['master_ip']
+  k8s_master_port = ctx.instance.runtime_properties['master_port']
+  k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
 
   if "kubernetes_resources" in ctx.instance.runtime_properties:
     for resource_name, kind_types in ctx.instance.runtime_properties['kubernetes_resources'].iteritems():
       ctx.logger.info("deleting resource={} types={}".format(resource_name, kind_types))
       for kind_type in kind_types:
-        cmd="sudo /usr/local/bin/kubectl delete {} {}".format(kind_type, resource_name)
-        output=run(cmd)
-        if(output.return_code):
-          raise(NonRecoverableError('kubectl delete failed:{}'.format(output.stderr)))
-  
-      
-  #cmd="sudo /usr/local/bin/kubectl delete {}s {}".format(ctx.instance.runtime_properties['kind'],ctx.node.properties['name'])
-  
-  #output=run(cmd)
-  #if(output.return_code):
-  #  raise(NonRecoverableError('kubectl delete failed:{}'.format(output.stderr)))
+        cmd = "delete {} {}".format(kind_type, resource_name)
+        ctx.logger.info("Running command '{}'".format(cmd))
+        execute_kubectl_command(k8s_master_url, cmd)
+
+
+#
+# Consumes subprocess logs
+#
+class OutputConsumer(object):
+    def __init__(self, out):
+        self.out = out
+        self.buffer = StringIO()
+        self.consumer = threading.Thread(target=self.consume_output)
+        self.consumer.daemon = True
+        self.consumer.start()
+
+    def consume_output(self):
+        for line in iter(self.out.readline, b''):
+            self.buffer.write(line)
+        self.out.close()
+
+    def join(self):
+        self.consumer.join()
+
+
+#
+# Raise an error if kubectl does not exist
+#
+def check_kubectl():
+    if not os.path.exists(KUBECTL_PATH):
+        error_message = "Couldn't find '{}'. Please make sure you have installed it on Cloudify manager".format(KUBECTL_PATH)
+        ctx.logger.error(error_message)
+        raise NonRecoverableError(error_message)
+
+
+#
+# Execute a bash command and return the output.
+# Raise an Exception if the command returns an error code.
+#
+def execute_kubectl_command(master_url, args):
+    check_kubectl()
+
+    command = "sudo {} -s {} {}".format(KUBECTL_PATH, master_url, args)
+    ctx.logger.info('Executing: {0}'.format(command))
+
+    process = subprocess.Popen(command,
+                               shell=True,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               preexec_fn=os.setsid)
+
+    return_code = None
+    stdout_consumer = OutputConsumer(process.stdout)
+    stderr_consumer = OutputConsumer(process.stderr)
+
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            break
+        time.sleep(0.1)
+
+    stdout_consumer.join()
+    stderr_consumer.join()
+
+    if return_code != 0:
+        error_message = "Script {0} encountered error with return code {1} and standard output {2}, error output {3}".format(command, return_code,
+                                                                                                                             stdout_consumer.buffer.getvalue(),
+                                                                                                                             stderr_consumer.buffer.getvalue())
+        error_message = str(unicode(error_message, errors='ignore'))
+        ctx.logger.error(error_message)
+        raise NonRecoverableError(error_message)
+    else:
+        ok_message = "Script {0} executed normally with standard output {1} and error output {2}".format(command, stdout_consumer.buffer.getvalue(),
+                                                                                                         stderr_consumer.buffer.getvalue())
+        ok_message = str(unicode(ok_message, errors='ignore'))
+        ctx.logger.info(ok_message)
+
+    return stdout_consumer.buffer.getvalue()
+
 
 #
 # Use kubectl to run and expose a service
 #
 @operation
 def kube_run_expose(**kwargs):
-  config=ctx.node.properties['config']
-  config_files=ctx.node.properties['config_files']
-  env['host_string']=ctx.instance.runtime_properties['master_ip']
-  env['user']=ctx.node.properties['ssh_username']
-  env['key_filename']=ctx.node.properties['ssh_keyfilename']
+  config = ctx.node.properties['config']
+  config_files = ctx.node.properties['config_files']
 
-  ctx.logger.info("fabric settings.  host_string={}  user={} key_filename={}".format(ctx.instance.runtime_properties['master_ip'],ctx.node.properties['ssh_username'],ctx.node.properties['ssh_keyfilename']))
+  k8s_master_ip = ctx.instance.runtime_properties['master_ip']
+  k8s_master_port = ctx.instance.runtime_properties['master_port']
+  k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
+
+  ctx.logger.info("Kubernetes master url={}".format(k8s_master_url))
 
   def write_and_run(d):
     fname="/tmp/kub_{}_{}.yaml".format(ctx.instance.id,time.time())
     with open(fname,'w') as f:
       yaml.safe_dump(d,f)
-    put(fname,fname)
-    cmd="sudo /usr/local/bin/kubectl -s http://localhost:8080 create -f "+fname + " >> /tmp/kubectl.out 2>&1"
-    ctx.logger.info("running create: {}".format(cmd))
-
-    output=run(cmd)
-    if(output.return_code):
-      raise(NonRecoverableError('kubectl create failed:{}'.format(output.stderr)))
+    cmd="create -f {}".format(fname)
+    execute_kubectl_command(k8s_master_url, cmd)
 
   #embedded config
   if(config):
@@ -258,19 +326,19 @@ def kube_run_expose(**kwargs):
   elif(len(config_files)):
 
     # /!\ Using dict won't work if using multiple Service or ReplicationController ...
-    resources={}
+    resources = {}
     for file in config_files:
       if (not ctx._local):
-        local_path=ctx.download_resource(file['file'])
+        local_path = ctx.download_resource(file['file'])
       else:
-        local_path=file['file']
+        local_path = file['file']
       with open(local_path) as f:
-        base=yaml.load(f)
+        base = yaml.load(f)
 
         #store kubernetes resources for uninstall
-        metadata_name=base['metadata']['name']
+        metadata_name = base['metadata']['name']
         if metadata_name not in resources:
-          resources[metadata_name]=[]
+          resources[metadata_name] = []
           resources[metadata_name].append(base['kind'])
 
       if('overrides' in file):
@@ -288,42 +356,39 @@ def kube_run_expose(**kwargs):
     for resource in resources:
        for kind_type in resources[resource]:
          if "Service" == kind_type:
-           add_service_in_runtime_properties(resource, ctx)
+           add_service_in_runtime_properties(k8s_master_url, resource, ctx)
 
     ctx.instance.runtime_properties['kubernetes_resources']=resources
-
 
   #built-in config
   else:
     # do kubectl run
-    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
+    cmd = 'run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
     if(ctx.node.properties['run_overrides']):
-      cmd=cmd+" --overrides={}".format(ctx.node.properties['run_overrides'])
-
-    output=run(cmd)
-    if(output.return_code):
-      raise(NonRecoverableError('kubectl run failed:{}'.format(output.stderr)))
+      cmd = cmd + " --overrides={}".format(ctx.node.properties['run_overrides'])
+    execute_kubectl_command(k8s_master_url, cmd)
 
     # do kubectl expose
-    cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
+    cmd = 'expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
     if(ctx.node.properties['expose_overrides']):
-      cmd=cmd+" --overrides={}".format(ctx.node.properties['expose_overrides'])
-
-    output=call(cmd)
-    if(output.return_code):
-      raise(NonRecoverableError('kubectl expose failed:{}'.format(output.stderr)))
+      cmd = cmd + " --overrides={}".format(ctx.node.properties['expose_overrides'])
+    execute_kubectl_command(k8s_master_url, cmd)
 
     # Add service runtime properties
-    add_service_in_runtime_properties(ctx.node.properties['name'], ctx)
+    add_service_in_runtime_properties(k8s_master_url, ctx.node.properties['name'], ctx)
 
-def add_service_in_runtime_properties(service_name, ctx):
-  cmd='sudo /usr/local/bin/kubectl -s http://localhost:8080 get service {} -o yaml'.format(service_name)
+
+#
+# Add service information into runtime properties to retrieve ports for endpoints
+#
+def add_service_in_runtime_properties(k8s_master_url, service_name, ctx):
+  cmd = 'get service {} -o yaml'.format(service_name)
   ctx.logger.info("Running command to retrieve services: {}".format(cmd))
-  output=run(cmd)
-  service_k8s=yaml.load(output)
+  output = execute_kubectl_command(k8s_master_url, cmd)
+  service_k8s = yaml.load(output)
   ctx.logger.info("Service {}={}".format(service_name, service_k8s))
-  service={}
-  service['name']=service_name
-  service['clusterIP']=service_k8s['spec']['clusterIP']
-  service['ports']=service_k8s['spec']['ports']
-  ctx.instance.runtime_properties['service']=service
+  service = {}
+  service['name'] = service_name
+  service['clusterIP'] = service_k8s['spec']['clusterIP']
+  service['ports'] = service_k8s['spec']['ports']
+  ctx.instance.runtime_properties['service'] = service
