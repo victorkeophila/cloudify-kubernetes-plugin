@@ -36,8 +36,90 @@ K8S_GET_SERVICE = "get_service"
 K8S_PROPS_CLUSTERIP = "clusterIP"
 K8S_PROPS_PORT = "port"
 
+NB_RETRIES_MAX = 20
 
+#
+# Consumes subprocess logs
+#
+class OutputConsumer(object):
+    def __init__(self, out):
+        self.out = out
+        self.buffer = StringIO()
+        self.consumer = threading.Thread(target=self.consume_output)
+        self.consumer.daemon = True
+        self.consumer.start()
+
+    def consume_output(self):
+        for line in iter(self.out.readline, b''):
+            self.buffer.write(line)
+        self.out.close()
+
+    def join(self):
+        self.consumer.join()
+
+
+#
+# Raise an error if kubectl does not exist
+#
+def check_kubectl():
+    if not os.path.exists(KUBECTL_PATH):
+        error_message = "Couldn't find '{}'. Please make sure you have installed it on Cloudify manager".format(KUBECTL_PATH)
+        ctx.logger.error(error_message)
+        raise NonRecoverableError(error_message)
+
+
+#
+# Execute a bash command and return the output.
+# Raise an Exception if the command returns an error code.
+#
+def execute_kubectl_command(args):
+    check_kubectl()
+
+    k8s_master_ip = ctx.instance.runtime_properties['master_ip']
+    k8s_master_port = ctx.instance.runtime_properties['master_port']
+    k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
+
+    command = "sudo {} -s {} {}".format(KUBECTL_PATH, k8s_master_url, args)
+    ctx.logger.info('Executing: {0}'.format(command))
+
+    process = subprocess.Popen(command,
+                               shell=True,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               preexec_fn=os.setsid)
+
+    return_code = None
+    stdout_consumer = OutputConsumer(process.stdout)
+    stderr_consumer = OutputConsumer(process.stderr)
+
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            break
+        time.sleep(0.1)
+
+    stdout_consumer.join()
+    stderr_consumer.join()
+
+    if return_code != 0:
+        error_message = "Script {0} encountered error with return code {1} and standard output {2}, error output {3}".format(command, return_code,
+                                                                                                                             stdout_consumer.buffer.getvalue(),
+                                                                                                                             stderr_consumer.buffer.getvalue())
+        error_message = str(unicode(error_message, errors='ignore'))
+        ctx.logger.warn(error_message)
+        raise RecoverableError(error_message)
+    else:
+        ok_message = "Script {0} executed normally with standard output {1} and error output {2}".format(command, stdout_consumer.buffer.getvalue(),
+                                                                                                         stderr_consumer.buffer.getvalue())
+        ok_message = str(unicode(ok_message, errors='ignore'))
+        ctx.logger.info(ok_message)
+
+    return stdout_consumer.buffer.getvalue()
+
+
+#
 # Called when connecting to master.  Gets ip and port
+#
 @operation
 def connect_master(**kwargs):
   ctx.logger.info("in connect_master")
@@ -67,9 +149,11 @@ def connect_master(**kwargs):
       raise
   else:
     raise(NonRecoverableError('unsupported relationship'))
-    
+ 
 
+#
 # called to connect to a deployment proxy.  generalization of connect_master
+#
 @operation
 def connect_proxy(**kwargs):
   if (ctx.target.node._node.type!='cloudify.nodes.DeploymentProxy'):
@@ -203,13 +287,16 @@ def get_one_relationship_instance(ctx, node_id):
   return None
 
 
-def wait_until_pods_deleted(k8s_master_url, resource_name):
+#
+# Wait to ensure that all pods are deleted
+#
+def wait_until_pods_deleted(resource_name):
     cmd = "get po -l app={} --no-headers 2>/dev/null | grep {} | wc -l".format(resource_name, resource_name)
-    current_pod_numbers = int(execute_kubectl_command(k8s_master_url, cmd))
+    current_pod_numbers = int(execute_kubectl_command(cmd))
     while current_pod_numbers != 0:
       ctx.logger.info("Waiting pods to ReplicationContoller {} to be deleted (remaining={})".format(resource_name, current_pod_numbers))
       time.sleep(1)
-      current_pod_numbers = int(execute_kubectl_command(k8s_master_url, cmd))
+      current_pod_numbers = int(execute_kubectl_command(cmd))
 
 
 #
@@ -218,136 +305,126 @@ def wait_until_pods_deleted(k8s_master_url, resource_name):
 #
 @operation
 def kube_delete(**kwargs):
-  k8s_master_ip = ctx.instance.runtime_properties['master_ip']
-  k8s_master_port = ctx.instance.runtime_properties['master_port']
-  k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
-
-  if "kubernetes_resources" in ctx.instance.runtime_properties:
-    for resource_name, kind_types in ctx.instance.runtime_properties['kubernetes_resources'].iteritems():
-      ctx.logger.info("deleting resource={} types={}".format(resource_name, kind_types))
-      for kind_type in kind_types:
-        cmd = "delete {} {}".format(kind_type, resource_name)
-        ctx.logger.info("Running command '{}'".format(cmd))
-        execute_kubectl_command(k8s_master_url, cmd)
-        if kind_type == 'ReplicationController':
-          wait_until_pods_deleted(k8s_master_url, resource_name)
-
-
-#
-# Consumes subprocess logs
-#
-class OutputConsumer(object):
-    def __init__(self, out):
-        self.out = out
-        self.buffer = StringIO()
-        self.consumer = threading.Thread(target=self.consume_output)
-        self.consumer.daemon = True
-        self.consumer.start()
-
-    def consume_output(self):
-        for line in iter(self.out.readline, b''):
-            self.buffer.write(line)
-        self.out.close()
-
-    def join(self):
-        self.consumer.join()
+  retry = 0
+  metadata_name = ctx.instance.runtime_properties['metadata_name']
+  while retry < NB_RETRIES_MAX: 
+    try:
+      ctx.logger.debug("Getting the number of replicas for resource {}".format(metadata_name))
+      nb_replicas_cmd="get rc --no-headers {}".format(metadata_name)
+      output = execute_kubectl_command(nb_replicas_cmd)
+      total_instances = int(output.split()[1])
+      if total_instances > 1:
+        ctx.logger.info("Resource {} has {} replicas. Decrease number.".format(metadata_name, total_instances))
+        _scale(False)
+      else:
+        ctx.logger.info("Resource {} has 1 replica left. Delete all resources.".format(metadata_name))
+        if "kubernetes_resources" in ctx.instance.runtime_properties:
+          for resource_name, kind_types in ctx.instance.runtime_properties['kubernetes_resources'].iteritems():
+            ctx.logger.info("Deleting resource={} types={}".format(resource_name, kind_types))
+            for kind_type in kind_types:
+              cmd = "delete {} {}".format(kind_type, resource_name)
+              execute_kubectl_command(cmd)
+              if kind_type == 'ReplicationController':
+                wait_until_pods_deleted(resource_name)
+      break
+    except:
+      retry += 1
+      ctx.logger.warn("Fail to delete {} (retry {}/{})".format(metadata_name, retry, NB_RETRIES_MAX))
+      time.sleep(1)
 
 
 #
-# Raise an error if kubectl does not exist
+# Wait to ensure that pods of a ReplicationController are running
 #
-def check_kubectl():
-    if not os.path.exists(KUBECTL_PATH):
-        error_message = "Couldn't find '{}'. Please make sure you have installed it on Cloudify manager".format(KUBECTL_PATH)
-        ctx.logger.error(error_message)
-        raise NonRecoverableError(error_message)
-
-
-#
-# Execute a bash command and return the output.
-# Raise an Exception if the command returns an error code.
-#
-def execute_kubectl_command(master_url, args):
-    check_kubectl()
-
-    command = "sudo {} -s {} {}".format(KUBECTL_PATH, master_url, args)
-    ctx.logger.info('Executing: {0}'.format(command))
-
-    process = subprocess.Popen(command,
-                               shell=True,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
-                               preexec_fn=os.setsid)
-
-    return_code = None
-    stdout_consumer = OutputConsumer(process.stdout)
-    stderr_consumer = OutputConsumer(process.stderr)
-
-    while True:
-        return_code = process.poll()
-        if return_code is not None:
-            break
-        time.sleep(0.1)
-
-    stdout_consumer.join()
-    stderr_consumer.join()
-
-    if return_code != 0:
-        error_message = "Script {0} encountered error with return code {1} and standard output {2}, error output {3}".format(command, return_code,
-                                                                                                                             stdout_consumer.buffer.getvalue(),
-                                                                                                                             stderr_consumer.buffer.getvalue())
-        error_message = str(unicode(error_message, errors='ignore'))
-        ctx.logger.error(error_message)
-        raise NonRecoverableError(error_message)
-    else:
-        ok_message = "Script {0} executed normally with standard output {1} and error output {2}".format(command, stdout_consumer.buffer.getvalue(),
-                                                                                                         stderr_consumer.buffer.getvalue())
-        ok_message = str(unicode(ok_message, errors='ignore'))
-        ctx.logger.info(ok_message)
-
-    return stdout_consumer.buffer.getvalue()
-
-
-def wait_until_pods_running(k8s_master_url, yaml_content):
+def wait_until_pods_running(yaml_content):
     if yaml_content['kind'] == 'ReplicationController':
         expected_replicas = int(yaml_content['spec']['replicas'])
         selector_app_value = yaml_content['spec']['selector']['app']
         cmd = "get po -l app={} --no-headers 2>/dev/null | grep Running | wc -l".format(selector_app_value)
-        current_replicas = int(execute_kubectl_command(k8s_master_url, cmd))
+        current_replicas = int(execute_kubectl_command(cmd))
         while current_replicas < expected_replicas:
             ctx.logger.info("Waiting for pod {} ({}/{})".format(selector_app_value, current_replicas, expected_replicas))
             time.sleep(1)
-            current_replicas = int(execute_kubectl_command(k8s_master_url, cmd))
+            current_replicas = int(execute_kubectl_command(cmd))
+
+
+#
+# Create a service if it does not already exists.
+#
+def create_service_if_not_exist(yaml_content):
+  try:
+    metadata_name = yaml_content['metadata']['name']
+    execute_kubectl_command("get svc {}".format(metadata_name))
+  except:
+    fname="/tmp/kub_{}_{}.yaml".format(ctx.instance.id,time.time())
+    with open(fname,'w') as f:
+      yaml.safe_dump(yaml_content,f)
+    cmd="create -f {}".format(fname)
+    execute_kubectl_command(cmd)
+    wait_until_pods_running(yaml_content)
+
+
+
+#
+# Scale or unscale (add or delete 1 replica)
+#
+def _scale(add=True):
+  metadata_name = ctx.instance.runtime_properties['metadata_name']
+
+  action = "Scale" if add else "Unscale"
+  ctx.logger.debug("{} resource {}".format(action, metadata_name))
+
+  # Get current number of replicas
+  ctx.logger.debug("Getting the number of replicas the resource {}".format(metadata_name))
+  nb_replicas_cmd="get rc --no-headers {}".format(metadata_name)
+  output = execute_kubectl_command(nb_replicas_cmd)
+  total_instances = int(output.split()[1])
+  amount = total_instances + (1 if add else -1)
+
+  # Add 1 instance
+  ctx.logger.info("The resource {} should currently have {} replicas. Try to increase to {}".format(metadata_name, total_instances, amount))
+  scale_cmd = "scale --current-replicas={} --replicas={} rc {}".format(total_instances, amount, metadata_name)
+  execute_kubectl_command(scale_cmd)
+
+
+#
+# Create a ReplicationController if it does not exist. Scale the instance by 1 otherwise.
+#
+def _create_or_scale(config, scale=False):
+  metadata_name = ctx.instance.runtime_properties['metadata_name']
+  retry = 0
+  while retry < NB_RETRIES_MAX: 
+    try:
+      do_create = False
+      try:
+        ctx.logger.debug("Checking existence of resource {}".format(metadata_name))
+        execute_kubectl_command("get rc {}".format(metadata_name))
+        do_create = False
+      except:
+        do_create = True
+
+      if do_create:
+        ctx.logger.info("Resource {} does not exist yet. Create it.".format(metadata_name))
+        create_service_if_not_exist(config)
+      else:
+        ctx.logger.info("Resource {} already exist. Try to scale it.".format(metadata_name))
+        _scale(True)
+      break
+    except:
+      retry += 1
+      ctx.logger.warn("Fail to scale {} (retry {}/{})".format(metadata_name, retry, NB_RETRIES_MAX))
+      time.sleep(1)
 
 
 #
 # Use kubectl to run and expose a service
 #
 @operation
-def kube_run_expose(**kwargs):
-  config = ctx.node.properties['config']
+def kube_run_expose(scale=False, **kwargs):
   config_files = ctx.node.properties['config_files']
 
-  k8s_master_ip = ctx.instance.runtime_properties['master_ip']
-  k8s_master_port = ctx.instance.runtime_properties['master_port']
-  k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
-
-  ctx.logger.info("Kubernetes master url={}".format(k8s_master_url))
-
-  def write_and_run(yaml_content):
-    fname="/tmp/kub_{}_{}.yaml".format(ctx.instance.id,time.time())
-    with open(fname,'w') as f:
-      yaml.safe_dump(yaml_content,f)
-    cmd="create -f {}".format(fname)
-    execute_kubectl_command(k8s_master_url, cmd)
-    wait_until_pods_running(k8s_master_url, yaml_content)
-
-  #embedded config
-  if(config):
-    write_and_run(config)
-
   #file config
-  elif(len(config_files)):
+  if(len(config_files)):
 
     # /!\ Using dict won't work if using multiple Service or ReplicationController ...
     resources = {}
@@ -356,6 +433,7 @@ def kube_run_expose(**kwargs):
         local_path = ctx.download_resource(file['file'])
       else:
         local_path = file['file']
+
       with open(local_path) as f:
         base = yaml.load(f)
 
@@ -364,6 +442,8 @@ def kube_run_expose(**kwargs):
         if metadata_name not in resources:
           resources[metadata_name] = []
           resources[metadata_name].append(base['kind'])
+        if base['kind'] == 'ReplicationController':
+          ctx.instance.runtime_properties['metadata_name'] = metadata_name
 
       if('overrides' in file):
         try: 
@@ -371,45 +451,29 @@ def kube_run_expose(**kwargs):
             ctx.logger.info("exeing o={}".format(o))
             #check for substitutions
             o=process_subs(o)
-            exec "base"+o in globals(),locals()
+            exec "base" + o in globals(), locals()
         except:
           raise(RecoverableError("Erreur in process_subs: {}".format(traceback.format_exc())))
-      write_and_run(base)
 
-    # Add service runtime properties
-    for resource in resources:
-       for kind_type in resources[resource]:
-         if "Service" == kind_type:
-           add_service_in_runtime_properties(k8s_master_url, resource, ctx)
+      if base['kind'] == 'ReplicationController':
+        _create_or_scale(base, scale)
+      elif base['kind'] == 'Service':
+        create_service_if_not_exist(base)
+        # Add service runtime properties
+        add_service_in_runtime_properties(metadata_name, ctx)
+      else:
+        raise NonRecoverableError("Kind {} not supported in the plugin".format(base['kind']))
 
     ctx.instance.runtime_properties['kubernetes_resources']=resources
-
-  #built-in config
-  else:
-    # !! Not used in Alien4Cloud plugin !!
-    # do kubectl run
-    cmd = 'run {} --image={} --port={} --replicas={}'.format(ctx.node.properties['name'],ctx.node.properties['image'],ctx.node.properties['target_port'],ctx.node.properties['replicas'])
-    if(ctx.node.properties['run_overrides']):
-      cmd = cmd + " --overrides={}".format(ctx.node.properties['run_overrides'])
-    execute_kubectl_command(k8s_master_url, cmd)
-
-    # do kubectl expose
-    cmd = 'expose rc {} --port={} --protocol={}'.format(ctx.node.properties['name'],ctx.node.properties['port'],ctx.node.properties['protocol'])
-    if(ctx.node.properties['expose_overrides']):
-      cmd = cmd + " --overrides={}".format(ctx.node.properties['expose_overrides'])
-    execute_kubectl_command(k8s_master_url, cmd)
-
-    # Add service runtime properties
-    add_service_in_runtime_properties(k8s_master_url, ctx.node.properties['name'], ctx)
 
 
 #
 # Add service information into runtime properties to retrieve ports for endpoints
 #
-def add_service_in_runtime_properties(k8s_master_url, service_name, ctx):
+def add_service_in_runtime_properties(service_name, ctx):
   cmd = 'get service {} -o yaml'.format(service_name)
   ctx.logger.info("Running command to retrieve services: {}".format(cmd))
-  output = execute_kubectl_command(k8s_master_url, cmd)
+  output = execute_kubectl_command(cmd)
   service_k8s = yaml.load(output)
   ctx.logger.info("Service {}={}".format(service_name, service_k8s))
   service = {}
