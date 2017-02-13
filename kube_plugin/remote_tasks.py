@@ -393,7 +393,12 @@ def _create_service_if_not_exist(yaml_content):
     execute_kubectl_command("get svc {}".format(metadata_name))
   except:
     ctx.logger.info("Service {} does not exist. Create it.".format(metadata_name))
-    _create_resource(yaml_content)
+    try:
+      _create_resource(yaml_content)
+    except RecoverableError as e:
+      if "already exists" in e.message:
+        ctx.logger.info("As a matter of fact, the service {} already exists.".format(metadata_name))
+        return
 
 
 #
