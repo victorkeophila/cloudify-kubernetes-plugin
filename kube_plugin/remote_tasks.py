@@ -68,7 +68,7 @@ def check_kubectl():
         ctx.logger.error(error_message)
         raise NonRecoverableError(error_message)
     else:
-        version_command = "sudo {} version --client".format(KUBECTL_PATH)
+        version_command = "{} version --client".format(KUBECTL_PATH)
         try:
             subprocess.check_call(version_command, stderr=None, stdout=None, shell=True)
         except:
@@ -86,7 +86,7 @@ def execute_kubectl_command(args):
     k8s_master_port = ctx.instance.runtime_properties['master_port']
     k8s_master_url = "http://{}:{}".format(k8s_master_ip, k8s_master_port)
 
-    command = "sudo {} -s {} {}".format(KUBECTL_PATH, k8s_master_url, args)
+    command = "{} -s {} {}".format(KUBECTL_PATH, k8s_master_url, args)
     ctx.logger.debug('Executing: {0}'.format(command))
 
     process = subprocess.Popen(command,
