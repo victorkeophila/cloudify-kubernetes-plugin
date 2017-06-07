@@ -252,10 +252,20 @@ def process_subs(s):
               if( field == "ip" ):
                 # Special treatment for ip value
                 host_instance_id = node_instance.host_id
-                host_instance = client.node_instances.get(host_instance_id)
-                if(host_instance):
-                  val = host_instance.runtime_properties['ip']
+                if host_instance_id:
+                  # If host instance exists, it means that we are using an hybrid deployment
+                  # Retrieve the ip address from the host
+                  host_instance = client.node_instances.get(host_instance_id)
+                  if(host_instance):
+                    val = host_instance.runtime_properties['ip']
                 else:
+                  # Here, we are evaluating a node without host (i.e. service)
+                  rtp = node_instance.runtime_properties
+                  for key in rtp:
+                    if 'ip_address' in key:
+                      val = rtp[key]
+                      break
+                if not val:
                   raise Exception("ip not found for node: {}".format(fields[0]))
               else:
                 val = val[field] #handle nested maps
